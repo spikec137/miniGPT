@@ -1,4 +1,3 @@
-# train.py
 import torch
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
@@ -6,10 +5,8 @@ from model import MiniGPT
 from dataset import load_dataset
 
 # 超参数
-# batch_size = 16
-# block_size = 64
-batch_size = 4 #一次训练“喂给模型”的样本数量（有点像多少碗饭一起端给模型吃）
-block_size = 8 #每个样本的输入序列长度（模型一次能看到多少上下文字符）
+batch_size = 4
+block_size = 8
 max_iters = 1000
 eval_interval = 100
 learning_rate = 1e-3
@@ -30,16 +27,13 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 for step in range(max_iters):
     for xb, yb in dataloader:
         xb, yb = xb.to(device), yb.to(device)
-        logits = model(xb)
-        B, T, C = logits.shape
-        loss = F.cross_entropy(logits.view(B * T, C), yb.view(B * T))
+        logits, loss = model(xb, yb)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        break  # 每轮只取一批数据（简化训练）
+        break  # 每轮只取一批数据
 
-    # 每隔 eval_interval 输出一次 loss
     if step % eval_interval == 0:
         print(f"Step {step}: loss = {loss.item():.4f}")
 
