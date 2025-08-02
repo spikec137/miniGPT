@@ -43,7 +43,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class MiniGPT(nn.Module):
-    def __init__(self, vocab_size, block_size, embed_size=64, num_layers=2):
+    def __init__(self, vocab_size, block_size, embed_size=64, num_layers=4): # 👈 默认 4 层
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, embed_size)
         self.position_embedding = nn.Embedding(block_size, embed_size)

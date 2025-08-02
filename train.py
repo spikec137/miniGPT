@@ -1,15 +1,19 @@
+# train.py
+
 import torch
 from torch.utils.data import DataLoader
-from torch.nn import functional as F
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 from model import MiniGPT
 from dataset import load_dataset
 
-# 超参数
-batch_size = 4
-block_size = 8
-max_iters = 1000
-eval_interval = 100
-learning_rate = 1e-3
+# 超参数配置
+batch_size = 4           # 每批次输入样本数量
+block_size = 8           # 序列长度（上下文长度）
+max_iters = 1000         # 训练步数
+eval_interval = 100      # 每隔多少步打印一次 loss
+learning_rate = 1e-3     # 学习率
+num_layers = 4             # Transformer 层数
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # 加载数据集
@@ -20,22 +24,44 @@ stoi = train_dataset.stoi
 itos = train_dataset.itos
 
 # 初始化模型
-model = MiniGPT(vocab_size=vocab_size, block_size=block_size).to(device)
+model = MiniGPT(
+    vocab_size=vocab_size,
+    block_size=block_size,
+    embed_size=64,
+    num_layers=num_layers
+).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+# 记录 loss 曲线
+losses = []
 
 # 训练循环
 for step in range(max_iters):
     for xb, yb in dataloader:
         xb, yb = xb.to(device), yb.to(device)
-        logits, loss = model(xb, yb)
 
+        logits, loss = model(xb, yb)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        break  # 每轮只取一批数据
 
+        break  # 每步只训练一批数据（简单快速训练）
+
+    # 每 eval_interval 步打印一次 loss
     if step % eval_interval == 0:
         print(f"Step {step}: loss = {loss.item():.4f}")
+        losses.append((step, loss.item()))
+
+# 保存 loss 曲线图
+if losses:
+    steps, loss_vals = zip(*losses)
+    plt.plot(steps, loss_vals, marker='o')
+    plt.xlabel("Training Step")
+    plt.ylabel("Loss")
+    plt.title("Training Loss Curve")
+    plt.grid(True)
+    plt.savefig("loss_curve.png")
+    print("✅ Loss 曲线保存为 loss_curve.png")
 
 # 保存模型
 ckpt = {
@@ -45,6 +71,7 @@ ckpt = {
     'block_size': block_size,
 }
 torch.save(ckpt, 'checkpoints/mini-gpt.pt')
+print("模型已保存到 checkpoints/mini-gpt.pt")
 
 # 测试生成
 model.eval()
