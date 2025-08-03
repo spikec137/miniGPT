@@ -8,12 +8,13 @@ from model import MiniGPT
 from dataset import load_dataset
 
 # 超参数配置
-batch_size = 4           # 每批次输入样本数量
+batch_size = 8           # 每批次输入样本数量
 block_size = 8           # 序列长度（上下文长度）
-max_iters = 1000         # 训练步数
+max_iters = 5000         # 训练步数
 eval_interval = 100      # 每隔多少步打印一次 loss
 learning_rate = 1e-3     # 学习率
-num_layers = 4             # Transformer 层数
+embed_size = 128          # 每个 token 表示成多长的向量
+num_layers = 12          # Transformer 层数
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # 加载数据集
@@ -28,7 +29,7 @@ itos = train_dataset.itos
 model = MiniGPT(
     vocab_size=vocab_size,
     block_size=block_size,
-    embed_size=64,
+    embed_size=embed_size,
     num_layers=num_layers
 ).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
