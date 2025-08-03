@@ -17,7 +17,8 @@ num_layers = 4             # Transformer 层数
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # 加载数据集
-train_dataset = load_dataset("data/tiny.txt", block_size)
+# train_dataset = load_dataset("data/tiny.txt", block_size)
+train_dataset = load_dataset("data/StrayBirds.txt", block_size)
 dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 vocab_size = train_dataset.vocab_size
 stoi = train_dataset.stoi
@@ -78,3 +79,13 @@ model.eval()
 context = torch.tensor([[stoi['你']]], dtype=torch.long).to(device)
 print("生成文本：")
 print(model.generate(context, max_new_tokens=100, stoi=stoi, itos=itos))
+
+ckpt = {
+    'model_state_dict': model.state_dict(),
+    'stoi': stoi,
+    'itos': itos,
+    'block_size': block_size,
+    'embed_size': embed_size,
+    'num_layers': num_layers
+}
+torch.save(ckpt, 'checkpoints/mini-gpt.pt')
