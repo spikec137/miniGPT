@@ -11,38 +11,45 @@ def main(args):
     learning_rates = args.learning_rates
     block_size = args.block_size
     # 遍历所有组合
-    for bs in batch_sizes:
-        for emb in embed_sizes:
-            for nl in num_layers_list:
-                for lr in learning_rates:
-                    # 构造输出文件夹名称
-                    folder_name = os.path.join("results", f"bs{bs}_emb{emb}_L{nl}_B{block_size}_lr{lr}")
-                    os.makedirs(folder_name, exist_ok=True)
-                    print(f"Training combination: batch={bs}, embed={emb}, layers={nl}, lr={lr}")
-                    # 调用 train.py 进行训练
-                    train_cmd = [
-                        sys.executable, "train.py",
-                        "--batch_size", str(bs),
-                        "--embed_size", str(emb),
-                        "--num_layers", str(nl),
-                        "--block_size", str(block_size),
-                        "--learning_rate", str(lr),
-                        "--epochs", str(args.epochs),
-                        "--output_dir", folder_name
-                    ]
-                    subprocess.run(train_cmd, check=True)
-                    # 训练完成后调用 generate.py 生成文本
-                    model_path = os.path.join(folder_name, 'model.pt')
-                    gen_cmd = [
-                        sys.executable, "generate.py",
-                        "--model_path", model_path,
-                        "--output_dir", folder_name,
-                        "--max_length", str(args.gen_length)
-                    ]
-                    if args.prompt:
-                        gen_cmd += ["--prompt", args.prompt]
-                    subprocess.run(gen_cmd, check=True)
-                    print(f"Completed combination: {folder_name}")
+    # sweep.py 中的修改示例
+    parser.add_argument('--data_dir', type=str, default='data', help='Directory containing data files')
+    args = parser.parse_args()
+    data_files = [f for f in os.listdir(args.data_dir) if f.endswith('.txt')]
+    for data_file in data_files:
+        data_path = os.path.join(args.data_dir, data_file)
+        dataset_name = os.path.splitext(data_file)[0]
+        for bs in batch_sizes:
+            for emb in embed_sizes:
+                for nl in num_layers_list:
+                    for lr in learning_rates:
+                        folder_name = os.path.join(
+                            "results", f"{dataset_name}_bs{bs}_emb{emb}_L{nl}_B{block_size}_lr{lr}"
+                        )
+                        os.makedirs(folder_name, exist_ok=True)
+                        train_cmd = [
+                            sys.executable, "train.py",
+                            "--batch_size", str(bs),
+                            "--embed_size", str(emb),
+                            "--num_layers", str(nl),
+                            "--block_size", str(block_size),
+                            "--learning_rate", str(lr),
+                            "--epochs", str(args.epochs),
+                            "--data_file", data_path,       # 数据集参数
+                            "--output_dir", folder_name
+                        ]
+                        subprocess.run(train_cmd, check=True)
+                        # 训练完成后调用 generate.py 生成文本
+                        model_path = os.path.join(folder_name, 'model.pt')
+                        gen_cmd = [
+                            sys.executable, "generate.py",
+                            "--model_path", model_path,
+                            "--output_dir", folder_name,
+                            "--max_length", str(args.gen_length)
+                        ]
+                        if args.prompt:
+                            gen_cmd += ["--prompt", args.prompt]
+                        subprocess.run(gen_cmd, check=True)
+                        print(f"Completed combination: {folder_name}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Hyperparameter sweep for MiniGPT training")

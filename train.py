@@ -77,7 +77,11 @@ def train_model(args):
     logger.info(f"Starting training: batch={args.batch_size}, embed={args.embed_size}, layers={args.num_layers}, lr={args.learning_rate}")
 
     # 示例数据：简单文本重复
-    text = "Hello world! " * 100
+    # text = "Hello world! " * 100
+    # parser.add_argument('--data_file', type=str, required=True, help='Path to data file')
+    # 在 train_model 中读取数据
+    with open(args.data_file, 'r', encoding='utf-8') as f:
+        text = f.read()
     dataset = CharDataset(text, block_size=args.block_size)
     train_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True)
 
@@ -142,5 +146,6 @@ if __name__ == '__main__':
     parser.add_argument('--learning_rate', type=float, default=0.001,help='Learning rate')
     parser.add_argument('--epochs',        type=int,   default=5,    help='Training epochs')
     parser.add_argument('--output_dir',    type=str,   default='.',   help='Output directory')
+    parser.add_argument('--data_file',     type=str,   required=True, help='Path to data file')
     args = parser.parse_args()
     train_model(args)
