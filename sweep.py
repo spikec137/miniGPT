@@ -1,120 +1,169 @@
-import argparse
 import os
-os.environ["MKL_THREADING_LAYER"] = "GNU"
+import itertools
 import subprocess
-import sys
-import glob
-import numpy as np
+import argparse
+import csv
+import time
+import torch
 
-def read_final_loss(folder):
-    loss_file = os.path.join(folder, 'loss.txt')
-    if not os.path.exists(loss_file):
-        return None
-    losses = np.loadtxt(loss_file)
-    if len(losses) == 0:
-        return None
-    return losses[-1]
-
-def run_training(data_file, bs, emb, nl, block_size, lr, epochs, output_dir):
-    os.makedirs(output_dir, exist_ok=True)
-    train_cmd = [
-        sys.executable, "train.py",
-        "--batch_size", str(bs),
-        "--embed_size", str(emb),
-        "--num_layers", str(nl),
-        "--block_size", str(block_size),
-        "--learning_rate", str(lr),
-        "--epochs", str(epochs),
-        "--data_file", data_file,
-        "--output_dir", output_dir
-    ]
-    subprocess.run(train_cmd, check=True)
-
-def run_generation(model_path, output_dir, prompt, gen_length):
+# -------------------------------
+# 文本生成函数
+# -------------------------------
+def run_generation(model_path, output_dir, prompt="", gen_length=100):
     gen_cmd = [
-        sys.executable, "generate.py",
+        "python", "generate.py",
         "--model_path", model_path,
         "--output_dir", output_dir,
         "--max_length", str(gen_length)
     ]
     if prompt:
         gen_cmd += ["--prompt", prompt]
-    subprocess.run(gen_cmd, check=True)
+    try:
+        subprocess.run(gen_cmd, check=True)
+        print(f"✅ Generation completed for {model_path}")
+    except subprocess.CalledProcessError:
+        print(f"⚠️ Generation failed for {model_path}")
 
+# -------------------------------
+# 训练 + 自动扩展逻辑
+# -------------------------------
+def run_training(data_file, params, fast_epochs, max_epochs, min_improve, result_dir, gen_length, prompt):
+    folder_name = f"{os.path.splitext(os.path.basename(data_file))[0]}_" \
+                  f"bs{params['batch_size']}_emb{params['embed_dim']}_L{params['num_layers']}" \
+                  f"_H{params['hidden_dim']}_lr{params['lr']}_dp{params['dropout']}"
+    save_dir = os.path.join(result_dir, folder_name)
+    os.makedirs(save_dir, exist_ok=True)
+
+    log_file = os.path.join(save_dir, "loss.txt")
+    model_path = os.path.join(save_dir, "model.pt")
+
+    epochs = fast_epochs
+    best_loss = float("inf")
+    patience = 2
+    bad_rounds = 0
+    max_mem_usage = 0
+
+    while epochs <= max_epochs:
+        cmd = [
+            "python", "train.py",
+            "--data_file", data_file,
+            "--save_dir", save_dir,
+            "--output_dir", save_dir,
+            "--epochs", str(epochs),
+            "--batch_size", str(params["batch_size"]),
+            "--embed_dim", str(params["embed_dim"]),
+            "--num_layers", str(params["num_layers"]),
+            "--hidden_dim", str(params["hidden_dim"]),
+            "--lr", str(params["lr"]),
+            "--dropout", str(params["dropout"])
+        ]
+
+        print(f"\n>>> Training: {folder_name}, epochs={epochs}")
+        subprocess.run(cmd, check=True)
+
+        # 读取 loss.txt 最新一行
+        try:
+            with open(log_file, "r") as f:
+                last_line = f.readlines()[-1].strip()
+                current_loss = float(last_line.split()[-1])
+        except Exception:
+            print("⚠️ Warning: cannot read loss.txt, stop training")
+            break
+
+        # 显存监控
+        if torch.cuda.is_available():
+            mem = torch.cuda.max_memory_allocated() / 1024 ** 2
+            max_mem_usage = max(max_mem_usage, mem)
+            torch.cuda.reset_peak_memory_stats()
+
+        improve = best_loss - current_loss
+        if improve > min_improve:
+            print(f"✅ Loss improved {improve:.4f}, continue training")
+            best_loss = current_loss
+            epochs *= 2
+            bad_rounds = 0
+        else:
+            bad_rounds += 1
+            print(f"⏹ Loss improvement {improve:.4f} < {min_improve}, bad_rounds={bad_rounds}")
+            if bad_rounds >= patience:
+                print("⚠️ Early stopping")
+                break
+
+    # 训练结束后生成文本
+    run_generation(model_path, save_dir, prompt=prompt, gen_length=gen_length)
+
+    return best_loss, model_path, max_mem_usage
+
+# -------------------------------
+# 主 sweep 逻辑
+# -------------------------------
 def main(args):
-    data_files = glob.glob(os.path.join("data", "*.txt"))
+    param_space = {
+        "batch_size": [8, 16, 32, 64],
+        "embed_dim": [32, 64, 128, 256],
+        "num_layers": [2, 4, 6, 8, 12],
+        "hidden_dim": [64, 128, 256, 512],
+        "lr": [1e-3, 5e-4, 1e-4],
+        "dropout": [0.0, 0.1, 0.2, 0.3]
+    }
 
-    for data_file in data_files:
-        data_name = os.path.basename(data_file).replace(".txt", "")
-        for bs in args.batch_sizes:
-            for emb in args.embed_sizes:
-                for nl in args.num_layers_list:
-                    for lr in args.learning_rates:
-                        folder_name = os.path.join(
-                            "results",
-                            f"{data_name}_bs{bs}_emb{emb}_L{nl}_B{args.block_size}_lr{lr}"
-                        )
-                        print(f"Fast training: data={data_file}, batch={bs}, embed={emb}, layers={nl}, lr={lr}")
-                        # 快速训练
-                        try:
-                            run_training(
-                                data_file, bs, emb, nl, args.block_size,
-                                lr, args.fast_epochs, folder_name
-                            )
-                        except subprocess.CalledProcessError:
-                            print(f"Fast training failed for {folder_name}")
-                            continue
+    keys, values = zip(*param_space.items())
+    param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
+    param_combinations = sorted(
+        param_combinations,
+        key=lambda p: (p["embed_dim"], p["num_layers"], p["hidden_dim"], p["batch_size"])
+    )
 
-                        final_loss = read_final_loss(folder_name)
-                        if final_loss is None:
-                            print(f"No loss info for {folder_name}, skipping full training")
-                            continue
-                        # 判断是否继续 full training
-                        if final_loss <= args.loss_threshold:
-                            full_epochs = args.fast_epochs
-                            total_epochs = 0
-                            last_loss = final_loss
-                            while full_epochs <= args.max_epochs:
-                                # 逐步增加训练步数
-                                try:
-                                    run_training(
-                                        data_file, bs, emb, nl, args.block_size,
-                                        lr, full_epochs, folder_name
-                                    )
-                                except subprocess.CalledProcessError:
-                                    print(f"Full training failed for {folder_name}")
-                                    break
+    os.makedirs(args.result_dir, exist_ok=True)
+    csv_path = os.path.join(args.result_dir, "sweep_results.csv")
 
-                                new_loss = read_final_loss(folder_name)
-                                if new_loss is None:
-                                    break
-                                improvement = last_loss - new_loss
-                                if improvement < args.min_improve:
-                                    print(f"Loss improvement {improvement:.4f} < min_improve, stop training")
-                                    break
-                                last_loss = new_loss
-                                full_epochs += args.step_epochs
-                                total_epochs += args.step_epochs
-                            # 训练完成，生成文本
-                            model_path = os.path.join(folder_name, 'model.pt')
-                            run_generation(model_path, folder_name, args.prompt, args.gen_length)
-                            print(f"Completed full training and generation for {folder_name}")
-                        else:
-                            print(f"Skip full training for {folder_name}, final_loss={final_loss:.4f}")
+    with open(csv_path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["dataset", "batch_size", "embed_dim", "num_layers",
+                         "hidden_dim", "lr", "dropout", "final_loss", "model_path", "max_mem_MB"])
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Adaptive hyperparameter sweep for MiniGPT")
-    parser.add_argument('--batch_sizes',   type=int, nargs='+', default=[16,32],    help='List of batch sizes')
-    parser.add_argument('--embed_sizes',   type=int, nargs='+', default=[64,128],   help='List of embedding sizes')
-    parser.add_argument('--num_layers_list', type=int, nargs='+', default=[2,4],   help='List of number of layers')
-    parser.add_argument('--learning_rates', type=float, nargs='+', default=[0.001,0.0005], help='List of learning rates')
-    parser.add_argument('--block_size',    type=int, default=16,    help='Block (sequence) size')
-    parser.add_argument('--fast_epochs',   type=int, default=100,     help='Epochs for fast test training')
-    parser.add_argument('--step_epochs',   type=int, default=100,     help='Epochs to add per full training step')
-    parser.add_argument('--max_epochs',    type=int, default=5000,    help='Maximum total epochs for full training')
-    parser.add_argument('--min_improve',   type=float, default=0.0001, help='Minimum loss improvement to continue training')
-    parser.add_argument('--loss_threshold',type=float, default=2.0,  help='Threshold loss to consider continuing full training')
-    parser.add_argument('--gen_length',    type=int, default=100,   help='Length of text to generate')
-    parser.add_argument('--prompt',        type=str, default='',     help='Optional prompt for generation')
+        for data_file in os.listdir(args.data_dir):
+            if not data_file.endswith(".txt"):
+                continue
+            data_path = os.path.join(args.data_dir, data_file)
+
+            for params in param_combinations:
+                try:
+                    loss, model_path, max_mem = run_training(
+                        data_path, params,
+                        args.fast_epochs, args.max_epochs,
+                        args.min_improve, args.result_dir,
+                        args.gen_length, args.prompt
+                    )
+                    writer.writerow([
+                        data_file,
+                        params["batch_size"],
+                        params["embed_dim"],
+                        params["num_layers"],
+                        params["hidden_dim"],
+                        params["lr"],
+                        params["dropout"],
+                        loss,
+                        model_path,
+                        max_mem
+                    ])
+                    csvfile.flush()
+                except subprocess.CalledProcessError:
+                    print(f"❌ Training failed for {params}, skipping...")
+                    continue
+
+# -------------------------------
+# CLI 入口
+# -------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--data_dir", type=str, default="data", help="训练数据文件夹")
+    parser.add_argument("--result_dir", type=str, default="results", help="结果保存文件夹")
+    parser.add_argument("--fast_epochs", type=int, default=64, help="快速预训练 epochs")
+    parser.add_argument("--max_epochs", type=int, default=4096, help="最大训练 epochs")
+    parser.add_argument("--min_improve", type=float, default=0.0001, help="最小 loss 改善值")
+    parser.add_argument("--gen_length", type=int, default=100, help="生成文本长度")
+    parser.add_argument("--prompt", type=str, default="", help="生成文本可选 prompt")
     args = parser.parse_args()
+
     main(args)
