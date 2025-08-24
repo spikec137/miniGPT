@@ -18,19 +18,17 @@ def generate_text(model_path, output_dir, prompt="", max_length=100):
             super().__init__()
             self.token_embedding = torch.nn.Embedding(vocab_size, embed_size)
             self.position_embedding = torch.nn.Embedding(block_size, embed_size)
-            encoder_layer = torch.nn.TransformerEncoderLayer(d_model=embed_size, nhead=2)
+            encoder_layer = torch.nn.TransformerEncoderLayer(d_model=embed_size, nhead=2, batch_first=True)
             self.transformer = torch.nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
             self.linear = torch.nn.Linear(embed_size, vocab_size)
 
         def forward(self, x):
-            batch_size, seq_len = x.size()
+            seq_len = x.size(1)
             pos_ids = torch.arange(seq_len, device=x.device).unsqueeze(0)
             tok_emb = self.token_embedding(x)
             pos_emb = self.position_embedding(pos_ids)
             h = tok_emb + pos_emb
-            h = h.permute(1, 0, 2)
             out = self.transformer(h)
-            out = out.permute(1, 0, 2)
             logits = self.linear(out)
             return logits
 

@@ -1,169 +1,224 @@
-import os
-import itertools
-import subprocess
 import argparse
+import os
+os.environ["MKL_THREADING_LAYER"] = "GNU"  # 解决 MKL+gomp 冲突
+import subprocess
+import sys
+import glob
 import csv
-import time
+import numpy as np
 import torch
 
-# -------------------------------
-# 文本生成函数
-# -------------------------------
-def run_generation(model_path, output_dir, prompt="", gen_length=100):
+def read_final_loss(folder):
+    loss_file = os.path.join(folder, 'loss.txt')
+    if not os.path.exists(loss_file):
+        return None
+    try:
+        losses = np.loadtxt(loss_file, dtype=float, ndmin=1)
+    except Exception:
+        # 兼容逐行读取
+        losses = []
+        with open(loss_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    losses.append(float(line.split()[-1]) if ' ' in line else float(line))
+                except:
+                    pass
+        if not losses:
+            return None
+        losses = np.array(losses, dtype=float)
+    if losses.size == 0:
+        return None
+    return float(losses[-1]), int(losses.size)
+
+def run_train_new(data_file, params, epochs, out_dir):
+    """首轮训练：不 resume，直接跑 epochs。"""
+    os.makedirs(out_dir, exist_ok=True)
+    cmd = [
+        sys.executable, "train.py",
+        "--data_file", data_file,
+        "--output_dir", out_dir,
+        "--epochs", str(epochs),
+        "--batch_size", str(params["batch_size"]),
+        "--num_layers", str(params["num_layers"]),
+        "--block_size", str(params["block_size"]),
+    ]
+    # 兼容你之前用到的别名参数（train.py 会处理优先级，不改变模型结构）
+    cmd += [
+        "--embed_dim", str(params["embed_dim"]),
+        "--hidden_dim", str(params["hidden_dim"]),
+        "--lr", str(params["lr"]),
+        "--dropout", str(params["dropout"])
+    ]
+    subprocess.run(cmd, check=True)
+
+def run_train_resume(data_file, params, extra_epochs, out_dir):
+    """增量训练：resume + extra_epochs。"""
+    if extra_epochs <= 0:
+        return
+    cmd = [
+        sys.executable, "train.py",
+        "--data_file", data_file,
+        "--output_dir", out_dir,
+        "--resume",
+        "--extra_epochs", str(extra_epochs),
+        "--batch_size", str(params["batch_size"]),
+        "--num_layers", str(params["num_layers"]),
+        "--block_size", str(params["block_size"]),
+    ]
+    cmd += [
+        "--embed_dim", str(params["embed_dim"]),
+        "--hidden_dim", str(params["hidden_dim"]),
+        "--lr", str(params["lr"]),
+        "--dropout", str(params["dropout"])
+    ]
+    subprocess.run(cmd, check=True)
+
+def run_generation(model_path, output_dir, prompt, gen_length):
     gen_cmd = [
-        "python", "generate.py",
+        sys.executable, "generate.py",
         "--model_path", model_path,
         "--output_dir", output_dir,
         "--max_length", str(gen_length)
     ]
     if prompt:
         gen_cmd += ["--prompt", prompt]
-    try:
-        subprocess.run(gen_cmd, check=True)
-        print(f"✅ Generation completed for {model_path}")
-    except subprocess.CalledProcessError:
-        print(f"⚠️ Generation failed for {model_path}")
+    subprocess.run(gen_cmd, check=True)
 
-# -------------------------------
-# 训练 + 自动扩展逻辑
-# -------------------------------
-def run_training(data_file, params, fast_epochs, max_epochs, min_improve, result_dir, gen_length, prompt):
-    folder_name = f"{os.path.splitext(os.path.basename(data_file))[0]}_" \
-                  f"bs{params['batch_size']}_emb{params['embed_dim']}_L{params['num_layers']}" \
-                  f"_H{params['hidden_dim']}_lr{params['lr']}_dp{params['dropout']}"
-    save_dir = os.path.join(result_dir, folder_name)
-    os.makedirs(save_dir, exist_ok=True)
-
-    log_file = os.path.join(save_dir, "loss.txt")
-    model_path = os.path.join(save_dir, "model.pt")
-
-    epochs = fast_epochs
-    best_loss = float("inf")
-    patience = 2
-    bad_rounds = 0
-    max_mem_usage = 0
-
-    while epochs <= max_epochs:
-        cmd = [
-            "python", "train.py",
-            "--data_file", data_file,
-            "--save_dir", save_dir,
-            "--output_dir", save_dir,
-            "--epochs", str(epochs),
-            "--batch_size", str(params["batch_size"]),
-            "--embed_dim", str(params["embed_dim"]),
-            "--num_layers", str(params["num_layers"]),
-            "--hidden_dim", str(params["hidden_dim"]),
-            "--lr", str(params["lr"]),
-            "--dropout", str(params["dropout"])
-        ]
-
-        print(f"\n>>> Training: {folder_name}, epochs={epochs}")
-        subprocess.run(cmd, check=True)
-
-        # 读取 loss.txt 最新一行
-        try:
-            with open(log_file, "r") as f:
-                last_line = f.readlines()[-1].strip()
-                current_loss = float(last_line.split()[-1])
-        except Exception:
-            print("⚠️ Warning: cannot read loss.txt, stop training")
-            break
-
-        # 显存监控
-        if torch.cuda.is_available():
-            mem = torch.cuda.max_memory_allocated() / 1024 ** 2
-            max_mem_usage = max(max_mem_usage, mem)
-            torch.cuda.reset_peak_memory_stats()
-
-        improve = best_loss - current_loss
-        if improve > min_improve:
-            print(f"✅ Loss improved {improve:.4f}, continue training")
-            best_loss = current_loss
-            epochs *= 2
-            bad_rounds = 0
-        else:
-            bad_rounds += 1
-            print(f"⏹ Loss improvement {improve:.4f} < {min_improve}, bad_rounds={bad_rounds}")
-            if bad_rounds >= patience:
-                print("⚠️ Early stopping")
-                break
-
-    # 训练结束后生成文本
-    run_generation(model_path, save_dir, prompt=prompt, gen_length=gen_length)
-
-    return best_loss, model_path, max_mem_usage
-
-# -------------------------------
-# 主 sweep 逻辑
-# -------------------------------
 def main(args):
-    param_space = {
-        "batch_size": [8, 16, 32, 64],
-        "embed_dim": [32, 64, 128, 256],
-        "num_layers": [2, 4, 6, 8, 12],
-        "hidden_dim": [64, 128, 256, 512],
-        "lr": [1e-3, 5e-4, 1e-4],
-        "dropout": [0.0, 0.1, 0.2, 0.3]
-    }
-
-    keys, values = zip(*param_space.items())
-    param_combinations = [dict(zip(keys, v)) for v in itertools.product(*values)]
-    param_combinations = sorted(
-        param_combinations,
-        key=lambda p: (p["embed_dim"], p["num_layers"], p["hidden_dim"], p["batch_size"])
-    )
-
+    # 搜索 data/*.txt
+    data_files = sorted(glob.glob(os.path.join(args.data_dir, "*.txt")))
     os.makedirs(args.result_dir, exist_ok=True)
     csv_path = os.path.join(args.result_dir, "sweep_results.csv")
 
-    with open(csv_path, "w", newline="") as csvfile:
+    # 组合空间（保持你原来的丰富度；从小到大）
+    batch_sizes = [8, 16, 32, 64]
+    embed_dims  = [32, 64, 128, 256]
+    num_layers  = [2, 4, 6, 8, 12]
+    block_sizes = [16, 32]  # 你之前固定 16；这里给一个可观察的变化
+    lrs         = [1e-3, 5e-4, 1e-4]
+    dropouts    = [0.0, 0.1, 0.2, 0.3]
+    hidden_dims = [64, 128, 256, 512]
+
+    # 写 CSV 头
+    write_header = not os.path.exists(csv_path)
+    with open(csv_path, "a", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["dataset", "batch_size", "embed_dim", "num_layers",
-                         "hidden_dim", "lr", "dropout", "final_loss", "model_path", "max_mem_MB"])
+        if write_header:
+            writer.writerow([
+                "dataset","batch_size","embed_dim","num_layers","block_size",
+                "hidden_dim","lr","dropout","final_loss","trained_epochs","model_path","max_mem_MB"
+            ])
 
-        for data_file in os.listdir(args.data_dir):
-            if not data_file.endswith(".txt"):
-                continue
-            data_path = os.path.join(args.data_dir, data_file)
+        for data_file in data_files:
+            data_name = os.path.splitext(os.path.basename(data_file))[0]
+            for bs in batch_sizes:
+                for emb in embed_dims:
+                    for nl in num_layers:
+                        for blk in block_sizes:
+                            for lr in lrs:
+                                for dp in dropouts:
+                                    for hd in hidden_dims:
+                                        params = {
+                                            "batch_size": bs,
+                                            "embed_dim": emb,
+                                            "num_layers": nl,
+                                            "block_size": blk,
+                                            "lr": lr,
+                                            "dropout": dp,
+                                            "hidden_dim": hd
+                                        }
 
-            for params in param_combinations:
-                try:
-                    loss, model_path, max_mem = run_training(
-                        data_path, params,
-                        args.fast_epochs, args.max_epochs,
-                        args.min_improve, args.result_dir,
-                        args.gen_length, args.prompt
-                    )
-                    writer.writerow([
-                        data_file,
-                        params["batch_size"],
-                        params["embed_dim"],
-                        params["num_layers"],
-                        params["hidden_dim"],
-                        params["lr"],
-                        params["dropout"],
-                        loss,
-                        model_path,
-                        max_mem
-                    ])
-                    csvfile.flush()
-                except subprocess.CalledProcessError:
-                    print(f"❌ Training failed for {params}, skipping...")
-                    continue
+                                        out_dir = os.path.join(
+                                            args.result_dir,
+                                            f"{data_name}_bs{bs}_emb{emb}_L{nl}_B{blk}_lr{lr}_dp{dp}"
+                                        )
+                                        model_path = os.path.join(out_dir, "model.pt")
 
-# -------------------------------
-# CLI 入口
-# -------------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+                                        print(f"\n=== Fast training: data={data_name}, bs={bs}, emb={emb}, L={nl}, B={blk}, lr={lr}, dp={dp} ===")
+                                        try:
+                                            # 首轮：fast_epochs
+                                            run_train_new(data_file, params, args.fast_epochs, out_dir)
+                                        except subprocess.CalledProcessError as e:
+                                            print(f"Fast training failed: {e}")
+                                            continue
+
+                                        # 读取当前 loss + 已训练总轮数
+                                        final_loss, trained_epochs = read_final_loss(out_dir)
+                                        if final_loss is None:
+                                            print(f"No loss info for {out_dir}, skipping.")
+                                            continue
+
+                                        # 记录显存峰值
+                                        max_mem = 0.0
+                                        if torch.cuda.is_available():
+                                            max_mem = torch.cuda.max_memory_allocated() / 1024**2
+                                            torch.cuda.reset_peak_memory_stats()
+
+                                        # 若不达标就直接进入“增量训练 + 早停”循环
+                                        best_loss = final_loss
+                                        current_epochs = trained_epochs
+                                        patience = 2
+                                        bad_rounds = 0
+
+                                        while current_epochs < args.max_epochs:
+                                            target = min(args.max_epochs, current_epochs * 2)
+                                            extra = target - current_epochs
+                                            if extra <= 0:
+                                                break  # 修复 4096 重复问题
+                                            print(f"Continue training (resume): +{extra} epochs to reach {target} total.")
+                                            try:
+                                                run_train_resume(data_file, params, extra, out_dir)
+                                            except subprocess.CalledProcessError as e:
+                                                print(f"Resume training failed: {e}")
+                                                break
+
+                                            # 训练后读取新的 loss 和总轮数
+                                            new_loss, new_trained = read_final_loss(out_dir)
+                                            if new_loss is None:
+                                                break
+                                            improvement = best_loss - new_loss
+                                            current_epochs = new_trained
+                                            best_loss = new_loss
+
+                                            if torch.cuda.is_available():
+                                                mem_now = torch.cuda.max_memory_allocated() / 1024**2
+                                                max_mem = max(max_mem, mem_now)
+                                                torch.cuda.reset_peak_memory_stats()
+
+                                            if improvement < args.min_improve:
+                                                bad_rounds += 1
+                                                print(f"Loss improvement {improvement:.6f} < min_improve {args.min_improve}, bad_rounds={bad_rounds}")
+                                                if bad_rounds >= patience:
+                                                    print("Early stopping due to small improvements.")
+                                                    break
+                                            else:
+                                                bad_rounds = 0
+                                                print(f"Loss improved by {improvement:.6f}, continue...")
+
+                                        # 生成样例
+                                        try:
+                                            run_generation(model_path, out_dir, args.prompt, args.gen_length)
+                                        except subprocess.CalledProcessError as e:
+                                            print(f"Generation failed: {e}")
+
+                                        # 结果落盘
+                                        writer.writerow([
+                                            data_name, bs, emb, nl, blk, hd, lr, dp,
+                                            best_loss, current_epochs, model_path, f"{max_mem:.2f}"
+                                        ])
+                                        csvfile.flush()
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Adaptive hyperparameter sweep for MiniGPT (resume training)")
     parser.add_argument("--data_dir", type=str, default="data", help="训练数据文件夹")
     parser.add_argument("--result_dir", type=str, default="results", help="结果保存文件夹")
-    parser.add_argument("--fast_epochs", type=int, default=64, help="快速预训练 epochs")
-    parser.add_argument("--max_epochs", type=int, default=4096, help="最大训练 epochs")
-    parser.add_argument("--min_improve", type=float, default=0.0001, help="最小 loss 改善值")
+    parser.add_argument("--fast_epochs", type=int, default=64, help="首轮快速训练 epochs")
+    parser.add_argument("--max_epochs", type=int, default=4096, help="最大训练 epochs（总计）")
+    parser.add_argument("--min_improve", type=float, default=1e-4, help="继续训练的最小 loss 改善阈值")
     parser.add_argument("--gen_length", type=int, default=100, help="生成文本长度")
     parser.add_argument("--prompt", type=str, default="", help="生成文本可选 prompt")
     args = parser.parse_args()
-
     main(args)
