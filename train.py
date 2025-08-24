@@ -43,27 +43,23 @@ class GPTModel(nn.Module):
         self.block_size = block_size
         self.token_embedding = nn.Embedding(vocab_size, embed_size)
         self.position_embedding = nn.Embedding(block_size, embed_size)
-        # 直接 batch_first 提升效率，且消除你之前的 warning
         encoder_layer = nn.TransformerEncoderLayer(d_model=embed_size, nhead=nhead, batch_first=True)
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.linear = nn.Linear(embed_size, vocab_size)
-        # 预注册位置索引缓冲，避免每步重复创建
         self.register_buffer("pos_ids", torch.arange(block_size).unsqueeze(0), persistent=False)
 
     def forward(self, x):
-        # x: (batch, seq_len)
         seq_len = x.size(1)
-        pos_emb = self.position_embedding(self.pos_ids[:, :seq_len])   # (1, seq_len, embed)
-        tok_emb = self.token_embedding(x)                               # (batch, seq_len, embed)
-        h = tok_emb + pos_emb                                           # (batch, seq_len, embed)
-        out = self.transformer(h)                                       # (batch, seq_len, embed)
-        logits = self.linear(out)                                       # (batch, seq_len, vocab)
+        pos_emb = self.position_embedding(self.pos_ids[:, :seq_len])
+        tok_emb = self.token_embedding(x)
+        h = tok_emb + pos_emb
+        out = self.transformer(h)
+        logits = self.linear(out)
         return logits
 
 def _setup_logger(log_path):
     logger = logging.getLogger("train")
     logger.setLevel(logging.INFO)
-    # 避免重复添加 handler
     if logger.handlers:
         logger.handlers.clear()
     fmt = logging.Formatter('%(asctime)s - %(levelname)s: %(message)s')
@@ -89,7 +85,6 @@ def _read_all_losses(loss_txt):
             try:
                 losses.append(float(line.split()[-1]) if ' ' in line else float(line))
             except ValueError:
-                # 容错：如果之前写了花样格式，尝试取末尾数字
                 try:
                     losses.append(float(line))
                 except Exception:
@@ -97,19 +92,13 @@ def _read_all_losses(loss_txt):
     return losses
 
 def train_model(args):
-    # 允许 sweep 里用 --save_dir 覆盖 --output_dir
-    if args.save_dir:
-        args.output_dir = args.save_dir
     os.makedirs(args.output_dir, exist_ok=True)
-
     log_file = os.path.join(args.output_dir, 'train.log')
     logger = _setup_logger(log_file)
 
-    # 兼容两个命名：embed_size/learning_rate 与 embed_dim/lr
     embed_size = args.embed_dim if args.embed_dim is not None else args.embed_size
     learning_rate = args.lr if args.lr is not None else args.learning_rate
 
-    # 读取数据
     with open(args.data_file, 'r', encoding='utf-8') as f:
         text = f.read()
     dataset = CharDataset(text, block_size=args.block_size)
@@ -117,7 +106,6 @@ def train_model(args):
         logger.error("Dataset is empty after applying block_size, cannot train.")
         sys.exit(1)
 
-    # DataLoader：更高效
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -125,24 +113,24 @@ def train_model(args):
         pin_memory=torch.cuda.is_available(),
         num_workers=min(4, os.cpu_count() or 1),
         persistent_workers=True if torch.cuda.is_available() else False,
-        prefetch_factor=2 if torch.cuda.is_available() else 2,
-        # drop_last=True //跳过不足一个 batch 的情况，导致 dataset 太小时直接没 batch,len(loader)=0,报错
-        drop_last = False
+        prefetch_factor=2,
+        drop_last=False
     )
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # 构建模型
     model = GPTModel(dataset.vocab_size, embed_size, args.block_size, args.num_layers).to(device)
 
-    # 如果 resume，则加载已有权重
     model_file = os.path.join(args.output_dir, 'model.pt')
+    total_epochs_done = 0
+    best_loss = float('inf')
+
     if args.resume and os.path.exists(model_file):
         ckpt = torch.load(model_file, map_location=device)
         model.load_state_dict(ckpt['model_state'])
         logger.info(f"Resumed weights from {model_file}")
+        if hasattr(ckpt, 'best_loss'):
+            best_loss = ckpt['best_loss']
 
-    # 优化器（保持 Adam，不用 AMP；用 foreach 提升效率）
     try:
         optimizer = optim.Adam(model.parameters(), lr=learning_rate, foreach=True)
     except TypeError:
@@ -150,36 +138,59 @@ def train_model(args):
 
     criterion = nn.CrossEntropyLoss()
 
-    # 训练轮数：首次训练用 epochs；增量训练用 extra_epochs
-    run_epochs = args.extra_epochs if args.resume else args.epochs
-    if run_epochs <= 0:
-        logger.info("No epochs to run (run_epochs<=0).")
-        return
+    # 判断小文本 vs 大文本
+    SMALL_DATASET_THRESHOLD = 5000  # 字符数小于 5000 认为是小文本
+    is_small_dataset = len(dataset) < SMALL_DATASET_THRESHOLD
+    run_epochs = args.epochs if not args.resume else args.extra_epochs
+    patience = args.patience
+    bad_rounds = 0
 
     logger.info(
         f"Starting {'RESUME' if args.resume else 'NEW'} training: "
         f"data={args.data_file}, batch={args.batch_size}, embed={embed_size}, "
-        f"layers={args.num_layers}, lr={learning_rate}, block={args.block_size}, epochs={run_epochs}"
-        + (f", hidden_dim={args.hidden_dim}, dropout={args.dropout}" if args.hidden_dim or args.dropout is not None else "")
+        f"layers={args.num_layers}, lr={learning_rate}, block={args.block_size}, "
+        f"total_epochs_done={total_epochs_done}, best_loss={best_loss}"
     )
 
-    losses_this_run = []
-    for epoch in range(1, run_epochs + 1):
+    while total_epochs_done < args.max_epochs:
         model.train()
         total_loss = 0.0
-        for x_batch, y_batch in loader:
-            x_batch = x_batch.to(device, non_blocking=True)
-            y_batch = y_batch.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            logits = model(x_batch)                         # (B,T,V)
-            loss = criterion(logits.reshape(-1, dataset.vocab_size), y_batch.reshape(-1))
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+        for epoch in range(1, run_epochs + 1):
+            for x_batch, y_batch in loader:
+                x_batch = x_batch.to(device, non_blocking=True)
+                y_batch = y_batch.to(device, non_blocking=True)
+                optimizer.zero_grad(set_to_none=True)
+                logits = model(x_batch)
+                loss = criterion(logits.reshape(-1, dataset.vocab_size), y_batch.reshape(-1))
+                loss.backward()
+                optimizer.step()
+                total_loss += loss.item()
 
         avg_loss = total_loss / len(loader)
-        losses_this_run.append(avg_loss)
-        logger.info(f"Epoch {epoch}/{run_epochs}, Loss: {avg_loss:.4f}")
+        total_epochs_done += run_epochs
+
+        logger.info(f"Epochs {total_epochs_done-run_epochs+1}-{total_epochs_done}, Loss: {avg_loss:.6f}")
+
+        # Early stopping
+        improvement = best_loss - avg_loss
+        if improvement < args.min_improve:
+            bad_rounds += 1
+            if bad_rounds >= patience:
+                logger.info("Early stopping: no sufficient improvement.")
+                break
+        else:
+            best_loss = avg_loss
+            bad_rounds = 0
+
+        # 小文本直接结束或大文本翻倍
+        if is_small_dataset:
+            if improvement < args.min_improve:
+                logger.info("Small dataset, stopping training early due to no improvement.")
+                break
+        else:
+            run_epochs = min(run_epochs*2, args.max_epochs - total_epochs_done)
+            if run_epochs <= 0:
+                break
 
     # 保存模型
     save_data = {
@@ -189,56 +200,46 @@ def train_model(args):
         'itos': dataset.itos,
         'embed_size': embed_size,
         'num_layers': args.num_layers,
-        'block_size': args.block_size
+        'block_size': args.block_size,
+        'best_loss': best_loss
     }
     torch.save(save_data, model_file)
-    logger.info(f"Saved model to {model_file}")
+    logger.info(f"Saved final model to {model_file}")
 
-    # 处理 loss.txt（追加或新建）
+    # 保存 loss
     loss_txt = os.path.join(args.output_dir, 'loss.txt')
-    mode = 'a' if args.resume and os.path.exists(loss_txt) else 'w'
-    with open(loss_txt, mode, encoding='utf-8') as f:
-        for l in losses_this_run:
-            f.write(f"{l}\n")
-    logger.info(f"Saved loss data to {loss_txt}")
+    with open(loss_txt, 'w', encoding='utf-8') as f:
+        f.write(f"{best_loss}\n")
 
-    # 重新读取全量 loss 绘图
-    all_losses = _read_all_losses(loss_txt)
-    if all_losses:
-        plt.figure()
-        plt.plot(range(1, len(all_losses)+1), all_losses, marker='o')
-        plt.xlabel('Epoch')
-        plt.ylabel('Loss')
-        plt.title('Training Loss')
-        plt.grid(True)
-        loss_plot = os.path.join(args.output_dir, 'loss.png')
-        plt.savefig(loss_plot)
-        logger.info(f"Saved loss plot to {loss_plot}")
+    # 绘制 loss 图
+    plt.figure()
+    plt.plot([best_loss], marker='o')
+    plt.xlabel('Final')
+    plt.ylabel('Loss')
+    plt.title('Training Loss')
+    plt.grid(True)
+    plt.savefig(os.path.join(args.output_dir, 'loss.png'))
 
     logger.info("Training complete.")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train MiniGPT model")
-    # 原有参数
-    parser.add_argument('--batch_size',    type=int,   default=16)
-    parser.add_argument('--embed_size',    type=int,   default=64)
-    parser.add_argument('--num_layers',    type=int,   default=2)
-    parser.add_argument('--block_size',    type=int,   default=16)
+    parser = argparse.ArgumentParser(description="Train MiniGPT with incremental epochs")
+    parser.add_argument('--batch_size', type=int, default=16)
+    parser.add_argument('--embed_size', type=int, default=64)
+    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--block_size', type=int, default=16)
     parser.add_argument('--learning_rate', type=float, default=0.001)
-    parser.add_argument('--epochs',        type=int,   default=5)
-    parser.add_argument('--output_dir',    type=str,   default='.')
-    parser.add_argument('--data_file',     type=str,   required=True, help='Path to data file')
-
-    # 你 sweep 里用到但原模型不严格依赖的参数（为了兼容传参）
-    parser.add_argument("--save_dir", type=str, default="", help="(optional) alias for output_dir")
+    parser.add_argument('--epochs', type=int, default=5)
+    parser.add_argument('--extra_epochs', type=int, default=5)
+    parser.add_argument('--max_epochs', type=int, default=1024)
+    parser.add_argument('--min_improve', type=float, default=1e-4)
+    parser.add_argument('--patience', type=int, default=2)
+    parser.add_argument('--output_dir', type=str, default='.')
+    parser.add_argument('--data_file', type=str, required=True)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--embed_dim", type=int, default=None)
-    parser.add_argument("--hidden_dim", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--hidden_dim", type=int, default=None)
     parser.add_argument("--dropout", type=float, default=None)
-
-    # 新增：增量训练开关
-    parser.add_argument("--resume", action="store_true", help="Continue training from existing model.pt in output_dir")
-    parser.add_argument("--extra_epochs", type=int, default=0, help="Extra epochs to run when --resume is set")
-
     args = parser.parse_args()
     train_model(args)
